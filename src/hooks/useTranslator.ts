@@ -243,16 +243,23 @@ export function useTranslator() {
 
   const cancel = useCallback(async () => {
     if (!jobId) return
-    log({ level: 'warn', message: 'İptal isteği gönderiliyor…' })
+    log({ level: 'warn', message: 'Durduruluyor — diskteki tüm JSON\'lar siliniyor…' })
+    stopPolling()
     try {
-      await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel?delete=true`, {
         method: 'POST',
       })
     } catch {
-      // ignore
+      // ignore — yine de local state'i sıfırla
     }
-    // Polling sonraki turda cancelled durumunu görecek
-  }, [jobId, log])
+    // Local state'i tamamen temizle ki kullanıcı taze başlangıç hissetsin
+    setProgress({})
+    setCurrentLang(null)
+    setRunning(false)
+    setJobId(null)
+    lastRunningLangsRef.current = new Set()
+    log({ level: 'success', message: 'Durduruldu. Diskte temiz — yeniden başlatabilirsin.' })
+  }, [jobId, log, stopPolling])
 
   const reset = useCallback(() => {
     if (running) return

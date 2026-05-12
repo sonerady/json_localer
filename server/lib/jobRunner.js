@@ -25,6 +25,7 @@ import {
   setAtPath,
 } from './jsonChunk.js'
 import {
+  deleteJob,
   ensureJobDir,
   getJobDir,
   getJobsRoot,
@@ -351,6 +352,30 @@ export function cancelJob(jobId, langOutputCode) {
   const job = activeJobs.get(jobId)
   if (!job) return false
   job.cancel(langOutputCode)
+  return true
+}
+
+/**
+ * Worker'ları durdurur, hepsinin promisini bekler, sonra job klasörünü
+ * (snapshotlar, progress, meta, source) tamamen siler. Kullanıcı "Durdur"
+ * dediğinde — yeniden başlatabilmesi için disk temizlenir.
+ */
+export async function cancelAndDeleteJob(jobId) {
+  const job = activeJobs.get(jobId)
+  if (job) {
+    job.cancel() // tüm dilleri abort
+    const promises = [...job.workers.values()]
+      .map((w) => w.promise)
+      .filter(Boolean)
+    // En fazla 10s bekle — workerlar zaten chunk'ın ortasındaysa onu bitirir
+    await Promise.race([
+      Promise.allSettled(promises),
+      new Promise((resolve) => setTimeout(resolve, 10000)),
+    ])
+    activeJobs.delete(jobId)
+  }
+  // Job klasörünü diskten kaldır
+  await deleteJob(jobId).catch(() => {})
   return true
 }
 

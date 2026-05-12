@@ -24,7 +24,12 @@ import {
   validateJobId,
   validateLang,
 } from '../lib/storage.js'
-import { cancelJob, getJobState, startJob } from '../lib/jobRunner.js'
+import {
+  cancelAndDeleteJob,
+  cancelJob,
+  getJobState,
+  startJob,
+} from '../lib/jobRunner.js'
 
 const router = Router()
 
@@ -144,6 +149,16 @@ router.post('/:jobId/cancel', async (req, res) => {
   try {
     validateJobId(req.params.jobId)
     const lang = req.body?.lang || req.query?.lang
+    // `delete=true` → worker'ları durdur + job klasörünü tamamen sil.
+    // (Kullanıcı sıfırdan başlatmak istediğinde.)
+    const shouldDelete =
+      req.body?.delete === true ||
+      req.query?.delete === 'true' ||
+      req.query?.delete === '1'
+    if (shouldDelete) {
+      await cancelAndDeleteJob(req.params.jobId)
+      return res.json({ ok: true, deleted: true })
+    }
     const ok = cancelJob(req.params.jobId, lang)
     if (!ok) {
       return res.status(404).json({ error: 'Job not active' })
