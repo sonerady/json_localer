@@ -138,10 +138,10 @@ export default function App() {
     reset()
   }, [reset])
 
-  // API key opsiyonel: server .env'inde varsa client'tan istemiyoruz.
+  // Server'da DEEPSEEK_API_KEY var mı? Yoksa çeviri yapamaz.
   const needsApiKey = !health?.hasEnvKey
   const canStart =
-    !!source && (!needsApiKey || !!apiKey) && targetCodes.length > 0 && !running
+    !!source && !needsApiKey && targetCodes.length > 0 && !running
 
   const handleStart = useCallback(() => {
     if (!canStart || !source) return
@@ -149,37 +149,31 @@ export default function App() {
       source,
       sourceFileName: fileName,
       targetCodes,
-      apiKey,
       model,
       chunkSize,
-      maxRetries: 3,
     })
-  }, [apiKey, canStart, chunkSize, fileName, model, source, start, targetCodes])
+  }, [canStart, chunkSize, fileName, model, source, start, targetCodes])
 
   const handleDownload = useCallback(
-    (code: string) => {
-      const item = progress[code]
-      if (!item?.result) return
+    async (code: string) => {
+      if (!jobId) return
       const loc = getLocaleByCode(code)
-      const fileName = loc ? `${getOutputCode(loc)}.json` : `${code}.json`
-      const blob = new Blob([JSON.stringify(item.result, null, 2)], {
-        type: 'application/json',
-      })
-      const url = URL.createObjectURL(blob)
+      if (!loc) return
+      const outputCode = getOutputCode(loc)
+      const url = `/api/jobs/${encodeURIComponent(jobId)}/snapshot/${encodeURIComponent(outputCode)}`
       const a = document.createElement('a')
       a.href = url
-      a.download = fileName
+      a.download = `${outputCode}.json`
       document.body.appendChild(a)
       a.click()
       a.remove()
-      URL.revokeObjectURL(url)
     },
-    [progress],
+    [jobId],
   )
 
   const handleDownloadAll = useCallback(() => {
     Object.values(progress)
-      .filter((p) => p.result && (p.status === 'done' || p.status === 'error'))
+      .filter((p) => p.status === 'done' || p.status === 'error')
       .forEach((p) => handleDownload(p.code))
   }, [progress, handleDownload])
 

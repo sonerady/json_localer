@@ -1,9 +1,9 @@
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
-import translateRouter from './routes/translate.js'
 import jobsRouter from './routes/jobs.js'
 import { getJobsRoot } from './lib/storage.js'
+import { autoResumeIncompleteJobs } from './lib/jobRunner.js'
 
 const PORT = Number(process.env.PORT) || 3001
 const app = express()
@@ -25,7 +25,6 @@ app.get('/api/health', (_req, res) => {
   })
 })
 
-app.use('/api/translate', translateRouter)
 app.use('/api/jobs', jobsRouter)
 
 // 404 yakalayıcı
@@ -39,12 +38,30 @@ app.use((err, _req, res, _next) => {
   res.status(err.status || 500).json({ error: err.message || 'Internal error' })
 })
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`[diress-locale-translator] listening on http://localhost:${PORT}`)
   console.log(`[diress-locale-translator] jobs dir: ${getJobsRoot()}`)
   if (!process.env.DEEPSEEK_API_KEY) {
     console.warn(
-      '[diress-locale-translator] DEEPSEEK_API_KEY not set in .env — client must send Authorization header.',
+      '[diress-locale-translator] DEEPSEEK_API_KEY not set in .env — translations will fail.',
     )
+  }
+
+  // Server restart sonrası diskte yarım kalan job'ları otomatik yeniden başlat.
+  // Bu sayede Render redeploy / crash durumlarında çeviri devam eder.
+  try {
+    const result = await autoResumeIncompleteJobs()
+    if (result.resumed.length) {
+      console.log(
+        `[auto-resume] ${result.resumed.length} job resumed: ${result.resumed
+          .map((r) => `${r.jobId}(${r.langCount})`)
+          .join(', ')}`,
+      )
+    }
+    if (result.skipped.length) {
+      console.log(`[auto-resume] ${result.skipped.length} skipped`)
+    }
+  } catch (e) {
+    console.error('[auto-resume failed]', e?.message || e)
   }
 })

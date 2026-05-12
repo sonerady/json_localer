@@ -84,7 +84,7 @@ export function LangProgressList({ progress, currentLang, onDownload }: LangProg
               </div>
               <div className="flex items-center gap-2">
                 {statusBadge(lp.status)}
-                {(lp.status === 'done' || lp.status === 'error') && !!lp.result && (
+                {(lp.status === 'done' || lp.status === 'error') && (
                   <button
                     type="button"
                     onClick={() => onDownload(lp.code)}

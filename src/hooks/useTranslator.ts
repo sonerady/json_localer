@@ -1,23 +1,17 @@
+// Server-driven çeviri akışı.
+//
+// Browser sadece "start" requesti atar; backend her dil için arka planda
+// worker çalıştırır. Browser ~2 saniyede /live endpoint'inden state'i çeker.
+// Tarayıcı kapansa bile worker'lar Render'da çalışmaya devam eder. Tekrar
+// açılınca localStorage'daki jobId ile yarım kalan job otomatik olarak izlenir.
+
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   APP_STORE_LOCALES,
-  type AppStoreLocale,
   getLocaleByCode,
   getOutputCode,
 } from '@/lib/appStoreLocales'
-import {
-  buildEmptyTemplate,
-  chunkLeaves,
-  collectStringLeaves,
-  leavesToPayload,
-} from '@/lib/jsonChunk'
-import {
-  fetchJobState,
-  findMatchingJob,
-  sleep,
-  translateChunk,
-  type JobState,
-} from '@/lib/deepseek'
+import { collectStringLeaves } from '@/lib/jsonChunk'
 
 export type LangStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled'
 
@@ -47,23 +41,71 @@ interface StartArgs {
   source: unknown
   sourceFileName?: string | null
   targetCodes: string[]
-  apiKey: string
   model: string
   chunkSize: number
-  maxRetries: number
+}
+
+interface ServerLangState {
+  code?: string
+  outputCode: string
+  status: LangStatus
+  chunksDone: number
+  chunksTotal: number
+  stringsDone: number
+  stringsTotal: number
+  error?: string | null
+  startedAt?: number
+  finishedAt?: number
+}
+
+interface ServerJobState {
+  jobId: string
+  sourceFileName?: string | null
+  stringsTotal: number
+  chunksTotal: number
+  chunkSize: number
+  langs: Record<string, ServerLangState>
 }
 
 const MAX_LOG_ENTRIES = 400
 const LS_JOB_ID = 'dlt.lastJobId'
+const POLL_INTERVAL_MS = 2000
 
-// Disk-dostu kısa UUID — 22 karakter Base64URL.
-function makeJobId(): string {
-  const bytes = new Uint8Array(16)
-  crypto.getRandomValues(bytes)
-  return btoa(String.fromCharCode(...bytes))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '')
+function findLocaleByOutputCode(outputCode: string) {
+  return APP_STORE_LOCALES.find((l) => getOutputCode(l) === outputCode)
+}
+
+function serverStateToProgress(
+  state: ServerJobState,
+): Record<string, LangProgress> {
+  const out: Record<string, LangProgress> = {}
+  for (const [outputCode, s] of Object.entries(state.langs)) {
+    const loc = s.code
+      ? getLocaleByCode(s.code)
+      : findLocaleByOutputCode(outputCode)
+    if (!loc) continue
+    out[loc.code] = {
+      code: loc.code,
+      name: loc.name,
+      nativeName: loc.nativeName,
+      status: s.status,
+      chunksTotal: s.chunksTotal,
+      chunksDone: s.chunksDone,
+      stringsTotal: s.stringsTotal,
+      stringsDone: s.stringsDone,
+      error: s.error || undefined,
+      startedAt: s.startedAt,
+      finishedAt: s.finishedAt,
+    }
+  }
+  return out
+}
+
+function anyActive(state: ServerJobState): boolean {
+  for (const s of Object.values(state.langs)) {
+    if (s.status === 'queued' || s.status === 'running') return true
+  }
+  return false
 }
 
 export function useTranslator() {
@@ -71,29 +113,17 @@ export function useTranslator() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [running, setRunning] = useState(false)
   const [currentLang, setCurrentLang] = useState<string | null>(null)
-  // jobId'yi başlangıçta localStorage'dan oku — sayfa kapansa bile son
-  // job'a referansı koruyalım (cross-session resume için).
   const [jobId, setJobId] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null
     return localStorage.getItem(LS_JOB_ID)
   })
+  const pollIntervalRef = useRef<number | null>(null)
+  const lastRunningLangsRef = useRef<Set<string>>(new Set())
+
   useEffect(() => {
     if (typeof window === 'undefined') return
     if (jobId) localStorage.setItem(LS_JOB_ID, jobId)
     else localStorage.removeItem(LS_JOB_ID)
-  }, [jobId])
-  // Aktif fetch'lerin AbortController set'i — cancel hepsini tek seferde keser.
-  const abortControllers = useRef<Set<AbortController>>(new Set())
-  const cancelFlag = useRef(false)
-  // Refs mirror state so `start` can read latest values without re-creating
-  // the callback on every progress update.
-  const progressRef = useRef(progress)
-  const jobIdRef = useRef(jobId)
-  useEffect(() => {
-    progressRef.current = progress
-  }, [progress])
-  useEffect(() => {
-    jobIdRef.current = jobId
   }, [jobId])
 
   const log = useCallback((entry: Omit<LogEntry, 'ts'>) => {
@@ -103,396 +133,210 @@ export function useTranslator() {
     })
   }, [])
 
-  const cancel = useCallback(() => {
-    cancelFlag.current = true
-    for (const c of abortControllers.current) c.abort()
-    log({ level: 'warn', message: 'Çeviri iptal edildi.' })
-  }, [log])
+  const stopPolling = useCallback(() => {
+    if (pollIntervalRef.current != null) {
+      window.clearInterval(pollIntervalRef.current)
+      pollIntervalRef.current = null
+    }
+  }, [])
+
+  const applyState = useCallback(
+    (state: ServerJobState) => {
+      const newProgress = serverStateToProgress(state)
+      setProgress(newProgress)
+
+      // Hangi diller şu an running, log üret
+      const nowRunning = new Set<string>()
+      for (const p of Object.values(newProgress)) {
+        if (p.status === 'running') nowRunning.add(p.code)
+      }
+
+      const prevRunning = lastRunningLangsRef.current
+      for (const code of nowRunning) {
+        if (!prevRunning.has(code)) {
+          const p = newProgress[code]
+          log({
+            level: 'info',
+            lang: code,
+            message: `${p.name} çevirisi başladı (parça ${p.chunksDone}/${p.chunksTotal}'den).`,
+          })
+        }
+      }
+      for (const code of prevRunning) {
+        if (!nowRunning.has(code) && newProgress[code]) {
+          const p = newProgress[code]
+          if (p.status === 'done') {
+            log({ level: 'success', lang: code, message: `${p.name} tamamlandı.` })
+          } else if (p.status === 'error') {
+            log({ level: 'error', lang: code, message: `${p.name} hata: ${p.error}` })
+          } else if (p.status === 'cancelled') {
+            log({ level: 'warn', lang: code, message: `${p.name} iptal edildi.` })
+          }
+        }
+      }
+      lastRunningLangsRef.current = nowRunning
+
+      // Sonuncu running olanı currentLang yap
+      const runningList = [...nowRunning]
+      if (runningList.length > 0) setCurrentLang(runningList[runningList.length - 1])
+      else setCurrentLang(null)
+
+      const stillActive = anyActive(state)
+      setRunning(stillActive)
+      return stillActive
+    },
+    [log],
+  )
+
+  const pollOnce = useCallback(
+    async (jobIdToFetch: string): Promise<boolean> => {
+      try {
+        const res = await fetch(
+          `/api/jobs/${encodeURIComponent(jobIdToFetch)}/live`,
+        )
+        if (res.status === 404) {
+          // Server'da yok — temizle
+          setJobId(null)
+          stopPolling()
+          return false
+        }
+        if (!res.ok) return true // hata, tekrar dene
+        const state = (await res.json()) as ServerJobState
+        const stillActive = applyState(state)
+        if (!stillActive) {
+          stopPolling()
+          log({ level: 'success', message: 'Tüm diller işlendi.' })
+        }
+        return stillActive
+      } catch {
+        return true // network hatası, polling devam
+      }
+    },
+    [applyState, log, stopPolling],
+  )
+
+  const startPolling = useCallback(
+    (jobIdToPoll: string) => {
+      stopPolling()
+      // İlk anlık fetch
+      void pollOnce(jobIdToPoll)
+      pollIntervalRef.current = window.setInterval(() => {
+        void pollOnce(jobIdToPoll)
+      }, POLL_INTERVAL_MS)
+    },
+    [pollOnce, stopPolling],
+  )
+
+  // Mount'ta localStorage'da jobId varsa otomatik olarak izlemeye başla.
+  useEffect(() => {
+    if (!jobId) return
+    log({
+      level: 'info',
+      message: `Önceki job izleniyor: ${jobId}…`,
+    })
+    startPolling(jobId)
+    return () => {
+      stopPolling()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const cancel = useCallback(async () => {
+    if (!jobId) return
+    log({ level: 'warn', message: 'İptal isteği gönderiliyor…' })
+    try {
+      await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+        method: 'POST',
+      })
+    } catch {
+      // ignore
+    }
+    // Polling sonraki turda cancelled durumunu görecek
+  }, [jobId, log])
 
   const reset = useCallback(() => {
     if (running) return
+    stopPolling()
     setProgress({})
     setLogs([])
     setCurrentLang(null)
     setJobId(null)
-  }, [running])
+    lastRunningLangsRef.current = new Set()
+  }, [running, stopPolling])
 
   const start = useCallback(
     async ({
       source,
       sourceFileName,
       targetCodes,
-      apiKey,
       model,
       chunkSize,
-      maxRetries,
     }: StartArgs) => {
       if (running) return
-      cancelFlag.current = false
-      abortControllers.current = new Set()
 
       const leaves = collectStringLeaves(source)
-      const chunks = chunkLeaves(leaves, chunkSize)
-
-      // === ADIM 1: DİSK TARAMASI (cross-session resume) ===
-      // İstek göndermeden ÖNCE server/jobs altındaki TÜM klasörleri tara.
-      // Şu anki source (stringsTotal) + chunkSize ile eşleşen en son güncellenen
-      // job'ı bul. localStorage geçersiz ise bile uygun job'ı keşfeder.
-      let diskJobId: string | null = null
-      let diskProgress: Record<string, LangProgress> = {}
-
       log({
         level: 'info',
-        message: `Disk taranıyor: ${leaves.length} string × parça ${chunkSize} ile eşleşen job aranıyor…`,
+        message: `Server'a iş gönderiliyor: ${leaves.length} string, ${targetCodes.length} dil…`,
       })
 
-      let state: JobState | null = await findMatchingJob(
-        leaves.length,
-        chunkSize,
-        sourceFileName,
-      )
-
-      // Eğer disk taramasından sonuç gelmediyse, localStorage'da tutulan son
-      // jobId'yi fallback olarak dene (folder rename gibi edge case'ler için).
-      if (!state) {
-        const storedJobId =
-          typeof window !== 'undefined' ? localStorage.getItem(LS_JOB_ID) : null
-        if (storedJobId) {
-          state = await fetchJobState(storedJobId)
-          if (
-            state &&
-            (state.meta?.stringsTotal !== leaves.length ||
-              state.meta?.chunkSize !== chunkSize)
-          ) {
-            state = null // params uyuşmuyor
-          }
-        }
-      }
-
-      if (state) {
-        diskJobId = state.jobId
-        for (const [outputCode, { progress: p }] of Object.entries(state.langs)) {
-          if (!p || typeof p.chunksDone !== 'number') continue
-          const loc = APP_STORE_LOCALES.find(
-            (l) => getOutputCode(l) === outputCode,
-          )
-          if (!loc) continue
-          const isDone = p.chunksTotal > 0 && p.chunksDone >= p.chunksTotal
-          diskProgress[loc.code] = {
+      // Lang descriptors — server outputCode bazlı çalışır
+      const langs = targetCodes
+        .map((code) => {
+          const loc = getLocaleByCode(code)
+          if (!loc) return null
+          return {
             code: loc.code,
-            name: loc.name,
-            nativeName: loc.nativeName,
-            status: isDone ? 'done' : 'queued',
-            chunksTotal: chunks.length,
-            chunksDone: Math.min(p.chunksDone, chunks.length),
-            stringsTotal: leaves.length,
-            stringsDone: p.stringsDone ?? 0,
+            outputCode: getOutputCode(loc),
+            target: {
+              language: loc.language,
+              nativeName: loc.nativeName,
+              code: loc.code,
+            },
           }
+        })
+        .filter(Boolean)
+
+      try {
+        const res = await fetch('/api/jobs/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jobId: jobId || undefined, // varsa mevcut joba ekle, yoksa yeni
+            source,
+            sourceFileName,
+            model,
+            chunkSize,
+            langs,
+          }),
+        })
+        if (!res.ok) {
+          const text = await res.text().catch(() => '')
+          throw new Error(`Backend HTTP ${res.status}: ${text.slice(0, 400)}`)
         }
-        const total = Object.keys(diskProgress).length
-        const done = Object.values(diskProgress).filter(
-          (l) => l.status === 'done',
-        ).length
-        const partial = total - done
+        const data = (await res.json()) as {
+          jobId: string
+          state: ServerJobState
+        }
+        setJobId(data.jobId)
         log({
           level: 'success',
-          message: `Disk'te ${state.jobId.slice(0, 8)}… job'u bulundu: ${total} dil (${done} tamam, ${partial} yarım). Yarım kalanlar kaldığı parçadan devam edecek.`,
-        })
-      } else {
-        log({
-          level: 'info',
-          message: `Eşleşen job bulunamadı — yeni job oluşturulacak.`,
-        })
-      }
-
-      // === ADIM 2: Resume kararı ===
-      // Öncelik: disk > in-session > yeni job.
-      const inSessionProgress = progressRef.current
-      const inSessionJobId = jobIdRef.current
-      const inSessionTotal = Object.values(inSessionProgress)[0]?.chunksTotal
-      const canResumeInSession =
-        !diskJobId &&
-        !!inSessionJobId &&
-        Object.keys(inSessionProgress).length > 0 &&
-        inSessionTotal === chunks.length
-
-      const prevProgress = diskJobId
-        ? diskProgress
-        : canResumeInSession
-          ? inSessionProgress
-          : {}
-      const prevJobId = diskJobId || (canResumeInSession ? inSessionJobId : null)
-      const canResume = !!prevJobId
-      const newJobId = canResume ? prevJobId! : makeJobId()
-      if (newJobId !== inSessionJobId) setJobId(newJobId)
-
-      if (canResume) {
-        log({
-          level: 'info',
-          message: `Mevcut job sürdürülüyor: ${newJobId} — yarım kalan diller devam edecek.`,
-        })
-      } else {
-        log({
-          level: 'info',
-          message: `Job oluşturuldu: ${newJobId} — ${leaves.length} string, ${chunks.length} parça (parça başına ${chunkSize}).`,
+          message: `Job başlatıldı: ${data.jobId} — backend worker'ları çalışıyor.`,
         })
         log({
           level: 'info',
-          message: `Disk: server/jobs/${newJobId}/  (her başarılı chunk anında diske yazılır)`,
+          message: `Tarayıcıyı kapatabilirsin — server arka planda devam eder. Sayfayı tekrar açtığında otomatik izlemeye geçer.`,
         })
+        applyState(data.state)
+        startPolling(data.jobId)
+      } catch (err) {
         log({
-          level: 'info',
-          message: `Paralel mod: seçilen tüm diller (${targetCodes.length}) aynı anda DeepSeek'e gönderiliyor.`,
+          level: 'error',
+          message: `Start hatası: ${err instanceof Error ? err.message : String(err)}`,
         })
-      }
-
-      const meta = {
-        jobId: newJobId,
-        sourceFileName: sourceFileName || null,
-        model,
-        chunkSize,
-        targetCodes,
-        stringsTotal: leaves.length,
-        chunksTotal: chunks.length,
-        createdAt: new Date().toISOString(),
-      }
-
-      // İlk progress haritası — sadece şu anda seçili olan diller. Resume
-      // sırasında "done" olanlar olduğu gibi taşınır; diğerleri queued'a
-      // alınır ama chunksDone/stringsDone/result korunur.
-      const initialProgress: Record<string, LangProgress> = {}
-      const processableCodes: string[] = []
-      for (const code of targetCodes) {
-        const loc = getLocaleByCode(code)
-        if (!loc) continue
-        const existing = canResume ? prevProgress[code] : undefined
-        if (existing?.status === 'done') {
-          initialProgress[code] = existing
-          continue
-        }
-        initialProgress[code] = {
-          code,
-          name: loc.name,
-          nativeName: loc.nativeName,
-          status: 'queued',
-          chunksTotal: chunks.length,
-          chunksDone: existing?.chunksDone ?? 0,
-          stringsTotal: leaves.length,
-          stringsDone: existing?.stringsDone ?? 0,
-          result: existing?.result,
-          error: undefined,
-        }
-        processableCodes.push(code)
-      }
-      setProgress(initialProgress)
-
-      if (processableCodes.length === 0) {
-        log({ level: 'info', message: 'İşlenecek dil yok — hepsi zaten tamamlanmış.' })
-        return
-      }
-
-      setRunning(true)
-
-      // Tek seferlik boş template — backend ilk chunk'ta diske tohumlar
-      const emptyTemplate = buildEmptyTemplate(source)
-
-      // Meta yalnızca bir kere gönderilir (ilk chunk'ta). Paralelde
-      // birden çok worker aynı anda first chunk'ı çalıştırabilir;
-      // ref ile koruyoruz ama yarış olursa backend overwrite zaten safe.
-      const metaSentRef = { current: false }
-
-      // Tek dil için chunk loop'unu çalıştır.
-      const processLang = async (code: string): Promise<void> => {
-        if (cancelFlag.current) return
-        const loc = getLocaleByCode(code)
-        if (!loc) return
-
-        const langEntry = progressRef.current[code]
-        if (langEntry?.status === 'done') {
-          log({
-            level: 'info',
-            lang: code,
-            message: `${loc.name} zaten tamamlanmış — atlanıyor.`,
-          })
-          return
-        }
-
-        setCurrentLang(code)
-        setProgress((p) => ({
-          ...p,
-          [code]: {
-            ...p[code],
-            status: 'running',
-            startedAt: Date.now(),
-            error: undefined,
-          },
-        }))
-
-        const outputCode = getOutputCode(loc)
-        const startFromChunk = langEntry?.chunksDone ?? 0
-
-        if (startFromChunk > 0) {
-          log({
-            level: 'info',
-            lang: code,
-            message: `${loc.name} (${loc.nativeName}) ${startFromChunk}/${chunks.length} parçadan devam ediyor → ${outputCode}.json`,
-          })
-        } else {
-          log({
-            level: 'info',
-            lang: code,
-            message: `${loc.name} (${loc.nativeName}) çevirisi başlıyor → ${outputCode}.json`,
-          })
-        }
-
-        let langError: string | undefined
-        let stringsDone = langEntry?.stringsDone ?? 0
-        let currentSnapshot: unknown = langEntry?.result ?? emptyTemplate
-
-        for (let i = startFromChunk; i < chunks.length; i++) {
-          if (cancelFlag.current) break
-          const chunk = chunks[i]
-          const payload = leavesToPayload(chunk)
-
-          let attempt = 0
-          while (true) {
-            if (cancelFlag.current) break
-            attempt++
-            const ac = new AbortController()
-            abortControllers.current.add(ac)
-            const chunkStart = Date.now()
-            log({
-              level: 'info',
-              lang: code,
-              message: `Parça ${i + 1}/${chunks.length} gönderiliyor (${chunk.length} string)… DeepSeek yanıtı bekleniyor.`,
-            })
-            try {
-              const isFirstChunkOfLang = i === 0
-              const sendMeta = isFirstChunkOfLang && !metaSentRef.current
-              if (sendMeta) metaSentRef.current = true
-
-              const { snapshot, stringsApplied } = await translateChunk(
-                payload,
-                loc,
-                {
-                  apiKey,
-                  model,
-                  signal: ac.signal,
-                  jobId: newJobId,
-                  lang: outputCode,
-                  templateInit: isFirstChunkOfLang ? emptyTemplate : undefined,
-                  meta: sendMeta ? meta : undefined,
-                  progress: {
-                    chunksDone: i + 1,
-                    chunksTotal: chunks.length,
-                    stringsDone,
-                    stringsTotal: leaves.length,
-                    status: 'running',
-                  },
-                },
-              )
-
-              stringsDone += stringsApplied
-              currentSnapshot = snapshot
-
-              setProgress((p) => ({
-                ...p,
-                [code]: {
-                  ...p[code],
-                  chunksDone: i + 1,
-                  stringsDone,
-                  result: snapshot,
-                },
-              }))
-              const elapsed = ((Date.now() - chunkStart) / 1000).toFixed(1)
-              log({
-                level: 'info',
-                lang: code,
-                message: `Parça ${i + 1}/${chunks.length} ✓ (${stringsApplied}/${chunk.length} string · ${elapsed}s) · diske yazıldı.`,
-              })
-              break
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err)
-              const isAbort = msg.toLowerCase().includes('abort')
-              if (isAbort && cancelFlag.current) break
-
-              if (attempt > maxRetries) {
-                langError = msg
-                log({
-                  level: 'error',
-                  lang: code,
-                  message: `Parça ${i + 1} ${maxRetries} denemede başarısız: ${msg}`,
-                })
-                break
-              }
-              const backoff = Math.min(1000 * 2 ** (attempt - 1), 8000)
-              log({
-                level: 'warn',
-                lang: code,
-                message: `Parça ${i + 1} hata (deneme ${attempt}/${maxRetries}). ${backoff}ms sonra tekrar denenecek.`,
-              })
-              await sleep(backoff)
-            } finally {
-              abortControllers.current.delete(ac)
-            }
-          }
-
-          if (langError) break
-          if (cancelFlag.current) break
-        }
-
-        if (cancelFlag.current) {
-          setProgress((p) => ({
-            ...p,
-            [code]: { ...p[code], status: 'cancelled', result: currentSnapshot },
-          }))
-          log({
-            level: 'warn',
-            lang: code,
-            message: `${loc.name} iptal edildi (mevcut hâl diskte).`,
-          })
-          return
-        }
-
-        if (langError) {
-          setProgress((p) => ({
-            ...p,
-            [code]: {
-              ...p[code],
-              status: 'error',
-              error: langError,
-              finishedAt: Date.now(),
-              result: currentSnapshot,
-            },
-          }))
-        } else {
-          setProgress((p) => ({
-            ...p,
-            [code]: {
-              ...p[code],
-              status: 'done',
-              result: currentSnapshot,
-              finishedAt: Date.now(),
-            },
-          }))
-          log({
-            level: 'success',
-            lang: code,
-            message: `${loc.name} tamamlandı.`,
-          })
-        }
-      }
-
-      // Tüm seçilen dilleri aynı anda paralel başlat.
-      await Promise.all(processableCodes.map((code) => processLang(code)))
-
-      setRunning(false)
-      setCurrentLang(null)
-      if (!cancelFlag.current) {
-        log({ level: 'success', message: 'Tüm diller işlendi.' })
       }
     },
-    [log, running],
+    [applyState, jobId, log, running, startPolling],
   )
 
   return { progress, logs, running, currentLang, jobId, start, cancel, reset }

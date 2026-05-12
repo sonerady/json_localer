@@ -1,4 +1,4 @@
-// Nested JSON ağacına path → string yazımı.
+// Nested JSON ağacına path → string yazımı ve leaf collection.
 // Client tarafındakinin (jsonChunk.ts) JS karşılığı.
 
 export function setAtPath(root, path, value) {
@@ -44,4 +44,46 @@ export function parseKeyToPath(key) {
   }
   if (buf) parts.push(buf)
   return parts
+}
+
+export function collectStringLeaves(obj, basePath = []) {
+  if (obj === null || obj === undefined) return []
+  if (typeof obj === 'string') return [{ path: basePath, value: obj }]
+  if (Array.isArray(obj)) {
+    return obj.flatMap((item, idx) => collectStringLeaves(item, [...basePath, idx]))
+  }
+  if (typeof obj === 'object') {
+    return Object.entries(obj).flatMap(([k, v]) =>
+      collectStringLeaves(v, [...basePath, k]),
+    )
+  }
+  return []
+}
+
+export function chunkLeaves(leaves, chunkSize) {
+  const chunks = []
+  for (let i = 0; i < leaves.length; i += chunkSize) {
+    chunks.push(leaves.slice(i, i + chunkSize))
+  }
+  return chunks
+}
+
+export function buildEmptyTemplate(obj) {
+  if (obj === null || obj === undefined) return obj
+  if (typeof obj === 'string') return ''
+  if (typeof obj !== 'object') return obj
+  if (Array.isArray(obj)) return obj.map((it) => buildEmptyTemplate(it))
+  const out = {}
+  for (const [k, v] of Object.entries(obj)) out[k] = buildEmptyTemplate(v)
+  return out
+}
+
+export function pathToKey(path) {
+  return path.map((p) => (typeof p === 'number' ? `[${p}]` : p)).join('.')
+}
+
+export function leavesToPayload(chunk) {
+  const out = {}
+  for (const leaf of chunk) out[pathToKey(leaf.path)] = leaf.value
+  return out
 }
