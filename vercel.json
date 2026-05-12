@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://json-localer.onrender.com/api/:path*"
+    }
+  ]
+}
