@@ -57,13 +57,12 @@ export default function App() {
     const langs = await fetchCompletedLangs()
     setCompletedOnDisk(new Set(langs))
   }, [])
+  // Mount + jobId/running her değiştiğinde refresh.
+  // - jobId değişince: silinen joblar serbest kalır, yeni job için stale data önlenir
+  // - running false'a düşünce: yeni biten dil hemen "Çevrildi" gözükür
   useEffect(() => {
     void refreshCompleted()
-  }, [refreshCompleted])
-  useEffect(() => {
-    // running false'a düştüğünde (çeviri bitti/iptal) yeniden çek
-    if (!running) void refreshCompleted()
-  }, [running, refreshCompleted])
+  }, [jobId, running, refreshCompleted])
 
   // localStorage'dan ayarları geri yükle (API anahtarı dahil — yerel araç).
   useEffect(() => {
@@ -125,11 +124,17 @@ export default function App() {
     [source],
   )
 
-  const handleFileLoad = useCallback((name: string, parsed: unknown, bytes: number) => {
-    setFileName(name)
-    setSource(parsed)
-    setSizeBytes(bytes)
-  }, [])
+  const handleFileLoad = useCallback(
+    async (name: string, parsed: unknown, bytes: number) => {
+      setFileName(name)
+      setSource(parsed)
+      setSizeBytes(bytes)
+      // Yeni dosya yüklendi → varsa eski job/progress'i temizle ki kullanıcı
+      // stale download butonları ile karşılaşmasın.
+      if (jobId) await reset()
+    },
+    [jobId, reset],
+  )
 
   const handleFileClear = useCallback(() => {
     setFileName(null)

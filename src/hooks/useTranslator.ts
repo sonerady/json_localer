@@ -261,15 +261,25 @@ export function useTranslator() {
     log({ level: 'success', message: 'Durduruldu. Diskte temiz — yeniden başlatabilirsin.' })
   }, [jobId, log, stopPolling])
 
-  const reset = useCallback(() => {
+  const reset = useCallback(async () => {
     if (running) return
     stopPolling()
+    // Server'daki job klasörünü de sil (varsa) ki disk birikmesin
+    if (jobId) {
+      try {
+        await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel?delete=true`, {
+          method: 'POST',
+        })
+      } catch {
+        // server unreachable → en azından local state'i temizliyoruz
+      }
+    }
     setProgress({})
     setLogs([])
     setCurrentLang(null)
     setJobId(null)
     lastRunningLangsRef.current = new Set()
-  }, [running, stopPolling])
+  }, [jobId, running, stopPolling])
 
   const start = useCallback(
     async ({
@@ -280,6 +290,31 @@ export function useTranslator() {
       chunkSize,
     }: StartArgs) => {
       if (running) return
+
+      // === Önceki işi tamamen sil (her Başlat = sıfırdan başlangıç) ===
+      // Server'daki klasör + local progress + localStorage temizlenir.
+      // Cross-session resume hâlâ çalışır çünkü mount'taki useEffect direkt
+      // /live polling başlatır; start() sadece kullanıcının elle Başlat'a
+      // bastığı durumda tetiklenir.
+      if (jobId) {
+        log({
+          level: 'info',
+          message: `Önceki job temizleniyor: ${jobId}…`,
+        })
+        stopPolling()
+        try {
+          await fetch(
+            `/api/jobs/${encodeURIComponent(jobId)}/cancel?delete=true`,
+            { method: 'POST' },
+          )
+        } catch {
+          // server unreachable — yine de devam
+        }
+        setProgress({})
+        setCurrentLang(null)
+        setJobId(null)
+        lastRunningLangsRef.current = new Set()
+      }
 
       const leaves = collectStringLeaves(source)
       log({
@@ -309,7 +344,7 @@ export function useTranslator() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            jobId: jobId || undefined, // varsa mevcut joba ekle, yoksa yeni
+            // jobId verilmedi → server yeni id üretir (eskisini zaten sildik)
             source,
             sourceFileName,
             model,
