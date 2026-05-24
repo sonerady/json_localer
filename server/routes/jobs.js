@@ -90,7 +90,7 @@ router.post('/start', async (req, res) => {
       jobId,
       source,
       sourceFileName: sourceFileName || null,
-      model: model || 'deepseek-v4-flash',
+      model: model || 'deepseek-v4-pro',
       chunkSize: Number(chunkSize) || 60,
       langs,
     })

@@ -54,7 +54,7 @@ export async function translateChunk({ payload, target, model, apiKey, signal })
   }
 
   const body = {
-    model: model || 'deepseek-v4-flash',
+    model: model || 'deepseek-v4-pro',
     messages: [
       { role: 'system', content: buildSystemPrompt(target) },
       {
@@ -65,6 +65,10 @@ export async function translateChunk({ payload, target, model, apiKey, signal })
     temperature: 0.2,
     response_format: { type: 'json_object' },
     stream: false,
+    // v4-pro default'ta reasoning mode'a giriyor — çeviri için bu hem gereksiz
+    // pahalı (~10K reasoning token/chunk) hem yavaş (her chunk dakikalar sürer).
+    // Disabled ile normal chat moduna düşer. v4-flash için bu param no-op.
+    thinking: { type: 'disabled' },
   }
 
   const res = await fetch(DEEPSEEK_URL, {

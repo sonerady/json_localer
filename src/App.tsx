@@ -21,7 +21,7 @@ const LS_TARGETS = 'dlt.targetCodes'
 
 export default function App() {
   const [apiKey, setApiKey] = useState('')
-  const [model, setModel] = useState('deepseek-v4-flash')
+  const [model, setModel] = useState('deepseek-v4-pro')
   const [chunkSize, setChunkSize] = useState(60)
   const [targetCodes, setTargetCodes] = useState<string[]>([])
 
@@ -389,13 +389,15 @@ export default function App() {
                 <div className="grid grid-cols-2 gap-3">
                   <div className="flex flex-col gap-1.5">
                     <label className="text-xs font-medium text-muted-foreground">Model</label>
-                    <Input
+                    <select
                       value={model}
                       onChange={(e) => setModel(e.target.value)}
-                      placeholder="deepseek-v4-flash"
-                      spellCheck={false}
                       disabled={inputsLocked}
-                    />
+                      className="h-9 rounded-md border border-input bg-transparent px-2 text-sm shadow-xs outline-none focus-visible:border-ring disabled:cursor-not-allowed disabled:opacity-50 numerals"
+                    >
+                      <option value="deepseek-v4-pro">deepseek-v4-pro</option>
+                      <option value="deepseek-v4-flash">deepseek-v4-flash</option>
+                    </select>
                   </div>
                   <div className="flex flex-col gap-1.5">
                     <label className="text-xs font-medium text-muted-foreground">
@@ -415,11 +417,10 @@ export default function App() {
                 </div>
                 <p className="text-[11px] leading-relaxed text-muted-foreground">
                   <span className="text-foreground">Önerilen:</span>{' '}
-                  <span className="numerals">deepseek-v4-flash</span> —
-                  çeviri için hızlı ve yeterli.{' '}
-                  <span className="numerals">deepseek-v4-pro</span> reasoning
-                  model olduğu için ÇOK yavaş (her chunk dakikalar sürer);
-                  yalnızca özel ihtiyaç için.
+                  <span className="numerals">deepseek-v4-pro</span> —
+                  daha kaliteli çeviri, ~3× pahalı (~$0.87/1M output token).{' '}
+                  <span className="numerals">deepseek-v4-flash</span> ucuz ve
+                  hızlı (~$0.28/1M); günlük iş için yeterli kalite.
                 </p>
               </CardContent>
             </Card>
